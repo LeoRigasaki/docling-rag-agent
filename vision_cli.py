@@ -34,6 +34,11 @@ from docling.datamodel.pipeline_options import PdfPipelineOptions
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling_core.types.doc import ImageRefMode, PictureItem, TableItem
 
+from ingestion.chunker import (
+    DEFAULT_HYBRID_MAX_TOKENS,
+    DEFAULT_HYBRID_MERGE_PEERS,
+    DEFAULT_HYBRID_TOKENIZER,
+)
 from ingestion.embedder import create_embedder
 from utils.providers import DEFAULT_LLM_MODEL
 
@@ -205,6 +210,24 @@ def normalize_json_value(value: Any) -> Dict[str, Any]:
     return {}
 
 
+def extract_metadata_pages(metadata: Dict[str, Any]) -> List[int]:
+    pages: List[int] = []
+
+    page_number = metadata.get("page_number")
+    if isinstance(page_number, int):
+        pages.append(page_number)
+
+    page_numbers = metadata.get("page_numbers")
+    if isinstance(page_numbers, list):
+        pages.extend(page for page in page_numbers if isinstance(page, int))
+
+    return sorted(set(pages))
+
+
+def chunk_modality(metadata: Dict[str, Any]) -> str:
+    return str(metadata.get("source_modality") or metadata.get("chunk_method") or "").strip()
+
+
 def extract_caption_text(item: Any, document: Any) -> str:
     caption = getattr(item, "caption_text", "")
     if callable(caption):
@@ -261,20 +284,21 @@ class DoclingAssetManager:
         self,
         cache_dir: str = DEFAULT_CACHE_DIR,
         image_scale: float = 1.5,
-        chunk_max_tokens: int = 512,
+        chunk_max_tokens: int = DEFAULT_HYBRID_MAX_TOKENS,
+        merge_peers: bool = DEFAULT_HYBRID_MERGE_PEERS,
     ):
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.image_scale = image_scale
         self.catalog_cache: Dict[str, DoclingAssetCatalog] = {}
 
-        tokenizer_model = "sentence-transformers/all-MiniLM-L6-v2"
+        tokenizer_model = DEFAULT_HYBRID_TOKENIZER
         logger.info("Initializing vision chunk tokenizer: %s", tokenizer_model)
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_model)
         self.chunker = HybridChunker(
             tokenizer=self.tokenizer,
             max_tokens=chunk_max_tokens,
-            merge_peers=True,
+            merge_peers=merge_peers,
         )
 
     async def get_catalog(self, source_path: Path) -> Optional[DoclingAssetCatalog]:
@@ -494,6 +518,8 @@ class VisionRAGCLI:
         limit: int = 4,
         vision_mode: str = "auto",
         max_vision_images: int = 3,
+        chunk_max_tokens: int = DEFAULT_HYBRID_MAX_TOKENS,
+        merge_peers: bool = DEFAULT_HYBRID_MERGE_PEERS,
     ):
         self.documents_root = Path(documents_root).resolve()
         self.scope_root = self.documents_root.parent if self.documents_root.is_file() else self.documents_root
@@ -501,13 +527,19 @@ class VisionRAGCLI:
         self.limit = limit
         self.vision_mode = vision_mode
         self.max_vision_images = max_vision_images
+        self.chunk_max_tokens = chunk_max_tokens
+        self.merge_peers = merge_peers
         self.cwd = Path.cwd().resolve()
         self.discovered_documents = self._discover_documents()
         self.allowed_sources, self.allowed_file_paths = self._build_document_scope_values()
 
         self.db_pool: Optional[asyncpg.Pool] = None
         self.embedder = create_embedder()
-        self.asset_manager = DoclingAssetManager(cache_dir=cache_dir)
+        self.asset_manager = DoclingAssetManager(
+            cache_dir=cache_dir,
+            chunk_max_tokens=chunk_max_tokens,
+            merge_peers=merge_peers,
+        )
         self.groq_client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
         self.text_model = os.getenv("LLM_CHOICE", DEFAULT_LLM_MODEL)
         self.vision_model = os.getenv("GROQ_VISION_MODEL", DEFAULT_VISION_MODEL)
@@ -576,7 +608,11 @@ class VisionRAGCLI:
             content = chunk.content.lower()
             term_hits = sum(1 for term in set(query_terms) if term in content)
             phrase_hits = sum(1 for phrase in set(query_phrases) if phrase in content)
-            return chunk.similarity + (0.03 * term_hits) + (0.08 * phrase_hits)
+            modality = chunk_modality(chunk.chunk_metadata)
+            modality_boost = 0.0
+            if modality == "ocr_page":
+                modality_boost = 0.05 * min(term_hits, 3)
+            return chunk.similarity + (0.04 * term_hits) + (0.1 * phrase_hits) + modality_boost
 
         return sorted(chunks, key=score, reverse=True)[:limit]
 
@@ -639,7 +675,7 @@ class VisionRAGCLI:
         query_embedding = await self.embedder.embed_query(query)
         embedding_str = "[" + ",".join(map(str, query_embedding)) + "]"
         limit = limit or self.limit
-        candidate_limit = max(limit * 4, 12)
+        candidate_limit = max(limit * 8, 24)
         scope_clause, scope_params, next_index = self._build_scope_clause(start_index=2)
 
         async with self.db_pool.acquire() as conn:
@@ -704,14 +740,14 @@ class VisionRAGCLI:
             markdown_path: Optional[Path] = None
             linked_tables: List[TableAsset] = []
             linked_images: List[ImageAsset] = []
-            page_numbers: List[int] = []
+            page_numbers = extract_metadata_pages(chunk.chunk_metadata)
 
             if source_path and supports_docling_assets(source_path):
                 catalog = await self.asset_manager.get_catalog(source_path)
                 if catalog is not None:
                     markdown_path = catalog.markdown_path
                     links = catalog.chunk_links.get(chunk.chunk_index, ChunkAssetLinks())
-                    page_numbers = links.page_numbers
+                    page_numbers = links.page_numbers or page_numbers
                     linked_tables = [
                         catalog.tables[asset_ref]
                         for asset_ref in links.table_refs
@@ -722,6 +758,18 @@ class VisionRAGCLI:
                         for asset_ref in links.image_refs
                         if asset_ref in catalog.images
                     ][:2]
+                    if not linked_tables and page_numbers:
+                        linked_tables = [
+                            table
+                            for table in catalog.tables.values()
+                            if table.page_no in page_numbers
+                        ][:2]
+                    if not linked_images and page_numbers:
+                        linked_images = [
+                            image
+                            for image in catalog.images.values()
+                            if image.page_no in page_numbers
+                        ][:2]
 
             enriched.append(
                 EnrichedChunk(
@@ -870,8 +918,9 @@ class VisionRAGCLI:
         for item in enriched_chunks:
             chunk = item.chunk
             pages = ", ".join(map(str, item.page_numbers)) if item.page_numbers else "unknown"
+            modality = chunk_modality(chunk.chunk_metadata) or "text"
             sections.append(
-                f"[Source: {chunk.document_title} | chunk={chunk.chunk_index} | similarity={chunk.similarity:.3f} | pages={pages}]"
+                f"[Source: {chunk.document_title} | chunk={chunk.chunk_index} | similarity={chunk.similarity:.3f} | pages={pages} | modality={modality}]"
             )
             sections.append(chunk.content.strip())
 
@@ -928,13 +977,15 @@ class VisionRAGCLI:
 
         context = self.build_context(query, enriched_chunks, vision_notes)
         system_prompt = (
-            "You answer questions using retrieved documentation from a private knowledge base. "
+            "You answer questions using only retrieved documentation from a private knowledge base. "
+            "Never answer from general knowledge or outside assumptions. "
             "Prefer retrieved chunk text and linked table markdown. "
-            "Use linked image analysis only when it materially helps answer the question. "
-            "You may infer or classify examples when the retrieved context supports that reasoning, "
-            "even if the answer is not stated verbatim. "
-            "Do not invent facts that are not supported by the retrieved context. "
-            "Cite supporting sources inline using [Document Title]."
+            "Use linked image analysis only when it directly supports the answer. "
+            "If the retrieved context does not directly answer the question, say exactly: "
+            "'The retrieved document does not directly answer this question.' "
+            "Then briefly mention the closest relevant evidence, if any. "
+            "Do not cite a source unless it directly supports the claim being made. "
+            "Include page numbers in citations when available using the format [Document Title p.X]."
         )
 
         response = await self.groq_client.chat.completions.create(
@@ -946,7 +997,8 @@ class VisionRAGCLI:
                     "content": (
                         "Answer the following question using only the retrieved context.\n\n"
                         f"{context}\n\n"
-                        "Give a direct answer first, then include concise source citations."
+                        "Give a direct answer first, then concise source citations. "
+                        "If support is partial or missing, explicitly say so instead of filling gaps."
                     ),
                 },
             ],
@@ -965,6 +1017,7 @@ class VisionRAGCLI:
         print(f"Text model:   {self.text_model}")
         print(f"Vision model: {self.vision_model}")
         print(f"Vision mode:  {self.vision_mode}")
+        print(f"Chunking:     max_tokens={self.chunk_max_tokens}, merge_peers={self.merge_peers}")
         print(f"Cache dir:    {self.cache_dir}")
         print(f"Scope:        {self.documents_root}")
         print("=" * 64 + f"{Colors.END}\n")
@@ -981,8 +1034,9 @@ class VisionRAGCLI:
   - Retrieves top text chunks from PGVector
   - Restricts retrieval to files inside the configured scope
   - Rebuilds linked tables and nearby figures from source docs on demand
+  - Reuses the ingestion chunking shape for figure/table linking
   - Uses table markdown directly
-  - Calls Groq vision only when the question appears image-dependent
+  - Calls Groq vision according to the configured mode
 """
         print(help_text)
 
@@ -1091,6 +1145,17 @@ def parse_args() -> argparse.Namespace:
         help="When to call the Groq vision model",
     )
     parser.add_argument(
+        "--chunk-max-tokens",
+        type=int,
+        default=DEFAULT_HYBRID_MAX_TOKENS,
+        help="Max tokens used for Docling asset-link chunking",
+    )
+    parser.add_argument(
+        "--merge-peers",
+        action="store_true",
+        help="Allow Docling asset-link chunking to merge small adjacent chunks",
+    )
+    parser.add_argument(
         "--max-vision-images",
         type=int,
         default=3,
@@ -1126,6 +1191,8 @@ async def main() -> None:
         cache_dir=args.cache_dir,
         limit=args.limit,
         vision_mode=args.vision_mode,
+        chunk_max_tokens=args.chunk_max_tokens,
+        merge_peers=args.merge_peers,
         max_vision_images=args.max_vision_images,
     )
 

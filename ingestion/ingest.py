@@ -7,6 +7,10 @@ import asyncio
 import logging
 import json
 import glob
+import re
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from datetime import datetime
@@ -35,6 +39,9 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+PDF_OCR_SOURCE_MODALITY = "ocr_page"
+PDF_OCR_CHUNK_METHOD = "pdf_page_ocr"
+
 
 class DocumentIngestionPipeline:
     """Pipeline for ingesting documents into vector DB and knowledge graph."""
@@ -62,11 +69,16 @@ class DocumentIngestionPipeline:
             chunk_size=config.chunk_size,
             chunk_overlap=config.chunk_overlap,
             max_chunk_size=config.max_chunk_size,
-            use_semantic_splitting=config.use_semantic_chunking
+            use_semantic_splitting=config.use_semantic_chunking,
+            max_tokens=config.hybrid_max_tokens,
+            merge_peers=config.hybrid_merge_peers,
         )
         
         self.chunker = create_chunker(self.chunker_config)
         self.embedder = create_embedder()
+        self._pdf_to_image_bin = shutil.which("pdftoppm")
+        self._ocr_bin = shutil.which("tesseract")
+        self._logged_missing_pdf_ocr_deps = False
         
         self._initialized = False
     
@@ -180,7 +192,26 @@ class DocumentIngestionPipeline:
             metadata=document_metadata,
             docling_doc=docling_doc  # Pass DoclingDocument for HybridChunker
         )
-        
+
+        ocr_chunks: List[DocumentChunk] = []
+        if self._should_extract_pdf_page_ocr(file_path):
+            ocr_chunks = await asyncio.to_thread(
+                self._build_pdf_page_ocr_chunks,
+                file_path,
+                document_title,
+                document_source,
+                document_metadata,
+                len(chunks),
+            )
+            if ocr_chunks:
+                logger.info(f"Created {len(ocr_chunks)} PDF OCR page chunks")
+                chunks.extend(ocr_chunks)
+
+        if chunks:
+            total_chunks = len(chunks)
+            for chunk in chunks:
+                chunk.metadata["total_chunks"] = total_chunks
+
         if not chunks:
             logger.warning(f"No chunks created for {document_title}")
             return IngestionResult(
@@ -252,6 +283,123 @@ class DocumentIngestionPipeline:
             files.extend(glob.glob(os.path.join(self.documents_folder, "**", pattern), recursive=True))
 
         return sorted(files)
+
+    def _should_extract_pdf_page_ocr(self, file_path: str) -> bool:
+        """Return True when PDF page OCR should be generated for this document."""
+        return self.config.enable_pdf_page_ocr and file_path.lower().endswith(".pdf")
+
+    def _build_pdf_page_ocr_chunks(
+        self,
+        file_path: str,
+        title: str,
+        source: str,
+        metadata: Dict[str, Any],
+        start_index: int,
+    ) -> List[DocumentChunk]:
+        """Create one OCR-backed chunk per PDF page when local OCR tools are available."""
+        if not self._pdf_to_image_bin or not self._ocr_bin:
+            if not self._logged_missing_pdf_ocr_deps:
+                logger.warning(
+                    "Skipping PDF page OCR because required binaries are missing "
+                    "(pdftoppm=%s, tesseract=%s)",
+                    bool(self._pdf_to_image_bin),
+                    bool(self._ocr_bin),
+                )
+                self._logged_missing_pdf_ocr_deps = True
+            return []
+
+        pdf_path = Path(file_path).resolve()
+        chunks: List[DocumentChunk] = []
+
+        try:
+            with tempfile.TemporaryDirectory(prefix="pdf-ocr-") as temp_dir:
+                image_prefix = str(Path(temp_dir) / "page")
+                render_cmd = [
+                    self._pdf_to_image_bin,
+                    "-png",
+                    "-r",
+                    str(self.config.pdf_ocr_dpi),
+                    str(pdf_path),
+                    image_prefix,
+                ]
+                subprocess.run(render_cmd, check=True, capture_output=True, text=True)
+
+                page_images = sorted(
+                    Path(temp_dir).glob("page-*.png"),
+                    key=lambda path: self._extract_page_number(path.stem) or 0,
+                )
+                for image_path in page_images:
+                    page_number = self._extract_page_number(image_path.stem)
+                    if page_number is None:
+                        continue
+
+                    ocr_cmd = [self._ocr_bin, str(image_path), "stdout"]
+                    ocr_result = subprocess.run(
+                        ocr_cmd,
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+                    if ocr_result.returncode != 0:
+                        logger.debug(
+                            "OCR failed for %s page %s: %s",
+                            pdf_path.name,
+                            page_number,
+                            ocr_result.stderr.strip(),
+                        )
+                        continue
+
+                    normalized_text = self._normalize_ocr_text(ocr_result.stdout)
+                    if len(normalized_text) < self.config.pdf_ocr_min_chars:
+                        continue
+
+                    content = (
+                        f"Document: {title}\n"
+                        f"Page: {page_number}\n"
+                        "OCR text:\n"
+                        f"{normalized_text}"
+                    )
+                    chunk_metadata = {
+                        **metadata,
+                        "title": title,
+                        "source": source,
+                        "chunk_method": PDF_OCR_CHUNK_METHOD,
+                        "source_modality": PDF_OCR_SOURCE_MODALITY,
+                        "page_number": page_number,
+                        "has_context": False,
+                        "ocr_engine": "tesseract",
+                    }
+                    chunks.append(
+                        DocumentChunk(
+                            content=content,
+                            index=start_index + len(chunks),
+                            start_char=0,
+                            end_char=len(content),
+                            metadata=chunk_metadata,
+                        )
+                    )
+        except subprocess.CalledProcessError as exc:
+            logger.warning(
+                "PDF page OCR failed for %s: %s",
+                pdf_path.name,
+                (exc.stderr or exc.stdout or str(exc)).strip(),
+            )
+
+        return chunks
+
+    def _extract_page_number(self, stem: str) -> Optional[int]:
+        """Extract a trailing page number from a rendered page filename."""
+        match = re.search(r"-(\d+)$", stem)
+        if not match:
+            return None
+        return int(match.group(1))
+
+    def _normalize_ocr_text(self, text: str) -> str:
+        """Normalize OCR output to reduce repeated whitespace noise."""
+        normalized = text.replace("\r", "\n")
+        normalized = re.sub(r"[ \t]+", " ", normalized)
+        normalized = re.sub(r"\n{3,}", "\n\n", normalized)
+        return normalized.strip()
     
     def _read_document(self, file_path: str) -> tuple[str, Optional[Any]]:
         """
@@ -462,7 +610,35 @@ async def main():
     parser.add_argument("--no-clean", action="store_true", help="Skip cleaning existing data before ingestion (default: cleans automatically)")
     parser.add_argument("--chunk-size", type=int, default=1000, help="Chunk size for splitting documents")
     parser.add_argument("--chunk-overlap", type=int, default=200, help="Chunk overlap size")
+    parser.add_argument(
+        "--hybrid-max-tokens",
+        type=int,
+        default=256,
+        help="Max tokens per Docling HybridChunker chunk",
+    )
+    parser.add_argument(
+        "--merge-peers",
+        action="store_true",
+        help="Allow Docling HybridChunker to merge small adjacent chunks",
+    )
     parser.add_argument("--no-semantic", action="store_true", help="Disable semantic chunking")
+    parser.add_argument(
+        "--no-pdf-page-ocr",
+        action="store_true",
+        help="Disable page-level OCR chunk extraction for PDFs",
+    )
+    parser.add_argument(
+        "--pdf-ocr-dpi",
+        type=int,
+        default=180,
+        help="Render DPI used for PDF page OCR",
+    )
+    parser.add_argument(
+        "--pdf-ocr-min-chars",
+        type=int,
+        default=40,
+        help="Minimum OCR characters required before a page is indexed",
+    )
     # Graph-related arguments removed
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
 
@@ -479,7 +655,12 @@ async def main():
     config = IngestionConfig(
         chunk_size=args.chunk_size,
         chunk_overlap=args.chunk_overlap,
-        use_semantic_chunking=not args.no_semantic
+        use_semantic_chunking=not args.no_semantic,
+        hybrid_max_tokens=args.hybrid_max_tokens,
+        hybrid_merge_peers=args.merge_peers,
+        enable_pdf_page_ocr=not args.no_pdf_page_ocr,
+        pdf_ocr_dpi=args.pdf_ocr_dpi,
+        pdf_ocr_min_chars=args.pdf_ocr_min_chars,
     )
 
     # Create and run pipeline - clean by default unless --no-clean is specified

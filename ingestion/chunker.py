@@ -29,6 +29,10 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_HYBRID_TOKENIZER = "sentence-transformers/all-MiniLM-L6-v2"
+DEFAULT_HYBRID_MAX_TOKENS = 256
+DEFAULT_HYBRID_MERGE_PEERS = False
+
 
 @dataclass
 class ChunkingConfig:
@@ -39,7 +43,9 @@ class ChunkingConfig:
     min_chunk_size: int = 100  # Minimum chunk size
     use_semantic_splitting: bool = True  # Use HybridChunker (recommended)
     preserve_structure: bool = True  # Preserve document structure
-    max_tokens: int = 512  # Maximum tokens for embedding models
+    max_tokens: int = DEFAULT_HYBRID_MAX_TOKENS  # Maximum tokens for embedding models
+    merge_peers: bool = DEFAULT_HYBRID_MERGE_PEERS
+    tokenizer_model: str = DEFAULT_HYBRID_TOKENIZER
 
     def __post_init__(self):
         """Validate configuration."""
@@ -47,6 +53,8 @@ class ChunkingConfig:
             raise ValueError("Chunk overlap must be less than chunk size")
         if self.min_chunk_size <= 0:
             raise ValueError("Minimum chunk size must be positive")
+        if self.max_tokens <= 0:
+            raise ValueError("Maximum tokens must be positive")
 
 
 @dataclass
@@ -88,18 +96,21 @@ class DoclingHybridChunker:
         self.config = config
 
         # Initialize tokenizer for token-aware chunking
-        model_id = "sentence-transformers/all-MiniLM-L6-v2"
-        logger.info(f"Initializing tokenizer: {model_id}")
-        self.tokenizer = AutoTokenizer.from_pretrained(model_id)
+        logger.info(f"Initializing tokenizer: {config.tokenizer_model}")
+        self.tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_model)
 
         # Create HybridChunker
         self.chunker = HybridChunker(
             tokenizer=self.tokenizer,
             max_tokens=config.max_tokens,
-            merge_peers=True  # Merge small adjacent chunks
+            merge_peers=config.merge_peers,
         )
 
-        logger.info(f"HybridChunker initialized (max_tokens={config.max_tokens})")
+        logger.info(
+            "HybridChunker initialized (max_tokens=%s, merge_peers=%s)",
+            config.max_tokens,
+            config.merge_peers,
+        )
 
     async def chunk_document(
         self,
