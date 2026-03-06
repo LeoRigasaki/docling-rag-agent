@@ -180,6 +180,7 @@ class IngestionConfig(BaseModel):
     use_semantic_chunking: bool = True
     hybrid_max_tokens: int = Field(default=256, ge=64, le=1024)
     hybrid_merge_peers: bool = False
+    enable_formula_enrichment: bool = False
     enable_pdf_page_ocr: bool = True
     pdf_ocr_dpi: int = Field(default=180, ge=72, le=300)
     pdf_ocr_min_chars: int = Field(default=40, ge=0, le=2000)

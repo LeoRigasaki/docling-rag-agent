@@ -18,6 +18,9 @@ import argparse
 
 import asyncpg
 from dotenv import load_dotenv
+from docling.datamodel.base_models import InputFormat
+from docling.datamodel.pipeline_options import PdfPipelineOptions
+from docling.document_converter import DocumentConverter, PdfFormatOption
 
 from .chunker import ChunkingConfig, create_chunker, DocumentChunk
 from .embedder import create_embedder
@@ -41,6 +44,7 @@ logger = logging.getLogger(__name__)
 
 PDF_OCR_SOURCE_MODALITY = "ocr_page"
 PDF_OCR_CHUNK_METHOD = "pdf_page_ocr"
+DOCLING_FORMATS = {".pdf", ".docx", ".doc", ".pptx", ".ppt", ".xlsx", ".xls", ".html", ".htm"}
 
 
 class DocumentIngestionPipeline:
@@ -400,6 +404,20 @@ class DocumentIngestionPipeline:
         normalized = re.sub(r"[ \t]+", " ", normalized)
         normalized = re.sub(r"\n{3,}", "\n\n", normalized)
         return normalized.strip()
+
+    def _build_docling_converter(self, file_ext: str) -> DocumentConverter:
+        """Build a Docling converter with optional formula enrichment for PDFs."""
+        if file_ext == ".pdf" and self.config.enable_formula_enrichment:
+            pipeline_options = PdfPipelineOptions()
+            pipeline_options.do_formula_enrichment = True
+            logger.info("Docling formula enrichment enabled for %s conversion", file_ext)
+            return DocumentConverter(
+                format_options={
+                    InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options),
+                }
+            )
+
+        return DocumentConverter()
     
     def _read_document(self, file_path: str) -> tuple[str, Optional[Any]]:
         """
@@ -418,15 +436,11 @@ class DocumentIngestionPipeline:
             return (content, None)  # No DoclingDocument for audio
 
         # Docling-supported formats (convert to markdown)
-        docling_formats = ['.pdf', '.docx', '.doc', '.pptx', '.ppt', '.xlsx', '.xls', '.html', '.htm']
-
-        if file_ext in docling_formats:
+        if file_ext in DOCLING_FORMATS:
             try:
-                from docling.document_converter import DocumentConverter
-
                 logger.info(f"Converting {file_ext} file using Docling: {os.path.basename(file_path)}")
 
-                converter = DocumentConverter()
+                converter = self._build_docling_converter(file_ext)
                 result = converter.convert(file_path)
 
                 # Export to markdown for consistent processing
@@ -628,6 +642,11 @@ async def main():
         help="Disable page-level OCR chunk extraction for PDFs",
     )
     parser.add_argument(
+        "--formula-enrichment",
+        action="store_true",
+        help="Enable Docling formula enrichment for PDFs (slower, especially on CPU)",
+    )
+    parser.add_argument(
         "--pdf-ocr-dpi",
         type=int,
         default=180,
@@ -658,6 +677,7 @@ async def main():
         use_semantic_chunking=not args.no_semantic,
         hybrid_max_tokens=args.hybrid_max_tokens,
         hybrid_merge_peers=args.merge_peers,
+        enable_formula_enrichment=args.formula_enrichment,
         enable_pdf_page_ocr=not args.no_pdf_page_ocr,
         pdf_ocr_dpi=args.pdf_ocr_dpi,
         pdf_ocr_min_chars=args.pdf_ocr_min_chars,

@@ -55,6 +55,7 @@ DEFAULT_OLLAMA_HOST = "http://localhost:11434"
 DEFAULT_OLLAMA_MODEL = "qwen3.5:0.8b"
 DEFAULT_CACHE_DIR = ".vision_cache"
 DEFAULT_RESPONSES_MD = "vision_cli_responses.md"
+DEFAULT_FORMULA_ENRICHMENT = False
 DOC_ASSET_SUFFIXES = {
     ".pdf",
     ".docx",
@@ -313,10 +314,12 @@ class DoclingAssetManager:
         image_scale: float = 1.5,
         chunk_max_tokens: int = DEFAULT_HYBRID_MAX_TOKENS,
         merge_peers: bool = DEFAULT_HYBRID_MERGE_PEERS,
+        formula_enrichment: bool = DEFAULT_FORMULA_ENRICHMENT,
     ):
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.image_scale = image_scale
+        self.formula_enrichment = formula_enrichment
         self.catalog_cache: Dict[str, DoclingAssetCatalog] = {}
 
         tokenizer_model = DEFAULT_HYBRID_TOKENIZER
@@ -346,6 +349,7 @@ class DoclingAssetManager:
         pipeline_options.images_scale = self.image_scale
         pipeline_options.generate_picture_images = True
         pipeline_options.generate_table_images = True
+        pipeline_options.do_formula_enrichment = self.formula_enrichment
 
         return DocumentConverter(
             format_options={
@@ -549,6 +553,7 @@ class VisionRAGCLI:
         chunk_max_tokens: int = DEFAULT_HYBRID_MAX_TOKENS,
         merge_peers: bool = DEFAULT_HYBRID_MERGE_PEERS,
         responses_md: str = DEFAULT_RESPONSES_MD,
+        formula_enrichment: bool = DEFAULT_FORMULA_ENRICHMENT,
     ):
         self.documents_root = Path(documents_root).resolve()
         self.scope_root = self.documents_root.parent if self.documents_root.is_file() else self.documents_root
@@ -561,6 +566,7 @@ class VisionRAGCLI:
         self.merge_peers = merge_peers
         self.responses_md_path = Path(responses_md).resolve()
         self.responses_md_path.parent.mkdir(parents=True, exist_ok=True)
+        self.formula_enrichment = formula_enrichment
         self.session_started_at = datetime.now().astimezone()
         self.responses_session_logged = False
         self.cwd = Path.cwd().resolve()
@@ -573,6 +579,7 @@ class VisionRAGCLI:
             cache_dir=cache_dir,
             chunk_max_tokens=chunk_max_tokens,
             merge_peers=merge_peers,
+            formula_enrichment=formula_enrichment,
         )
         self.groq_client: Optional[AsyncGroq] = None
         self.ollama_client: Optional[AsyncClient] = None
@@ -1186,6 +1193,7 @@ class VisionRAGCLI:
                 f"- Provider: {self.provider}\n"
                 f"- Text model: {self.text_model}\n"
                 f"- Vision model: {self.vision_model}\n"
+                f"- Formula enrichment: {self.formula_enrichment}\n"
                 f"- Scope: {self.documents_root}\n\n"
             )
             with self.responses_md_path.open("a", encoding="utf-8") as handle:
@@ -1206,6 +1214,7 @@ class VisionRAGCLI:
             f"- Provider: {self.provider}\n"
             f"- Text model: {self.text_model}\n"
             f"- Vision model: {self.vision_model}\n"
+            f"- Formula enrichment: {self.formula_enrichment}\n"
             f"- Vision used: {used_vision}\n"
             f"- Sources: {', '.join(unique_sources) if unique_sources else 'none'}\n"
             f"- Linked tables: {linked_tables}\n"
@@ -1270,6 +1279,7 @@ class VisionRAGCLI:
         if self.provider == "ollama":
             print(f"Ollama host:  {self.ollama_host}")
         print(f"Vision mode:  {self.vision_mode}")
+        print(f"Formulas:     {'enabled' if self.formula_enrichment else 'disabled'}")
         print(f"Chunking:     max_tokens={self.chunk_max_tokens}, merge_peers={self.merge_peers}")
         print(f"Cache dir:    {self.cache_dir}")
         print(f"Responses MD: {self.responses_md_path}")
@@ -1290,6 +1300,7 @@ class VisionRAGCLI:
   - Rebuilds linked tables and nearby figures from source docs on demand
   - Reuses the ingestion chunking shape for figure/table linking
   - Uses table markdown directly
+  - Can enable Docling formula enrichment for PDFs when formula fidelity matters
   - Uses the selected provider for text and optional vision reasoning
   - Appends each question/answer/context summary to the configured markdown file
 """
@@ -1426,6 +1437,11 @@ def parse_args() -> argparse.Namespace:
         help="Maximum number of linked images to send to the provider vision model per query",
     )
     parser.add_argument(
+        "--formula-enrichment",
+        action="store_true",
+        help="Enable Docling formula enrichment for PDFs (slower, especially on CPU-only paths)",
+    )
+    parser.add_argument(
         "--responses-md",
         default=DEFAULT_RESPONSES_MD,
         help="Markdown file used to append question, answer, and context summaries",
@@ -1461,6 +1477,7 @@ async def main() -> None:
         merge_peers=args.merge_peers,
         max_vision_images=args.max_vision_images,
         responses_md=args.responses_md,
+        formula_enrichment=args.formula_enrichment,
     )
 
     try:
