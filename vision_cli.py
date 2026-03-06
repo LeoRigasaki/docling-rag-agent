@@ -18,6 +18,7 @@ import os
 import re
 import sys
 from dataclasses import dataclass, field
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
@@ -25,6 +26,8 @@ from typing import Any, Dict, List, Optional, Set
 import asyncpg
 from dotenv import load_dotenv
 from groq import AsyncGroq
+from ollama import AsyncClient, ResponseError
+from pydantic import BaseModel, ValidationError
 from PIL import Image
 from transformers import AutoTokenizer
 
@@ -48,7 +51,10 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 logger = logging.getLogger(__name__)
 
 DEFAULT_VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+DEFAULT_OLLAMA_HOST = "http://localhost:11434"
+DEFAULT_OLLAMA_MODEL = "qwen3.5:0.8b"
 DEFAULT_CACHE_DIR = ".vision_cache"
+DEFAULT_RESPONSES_MD = "vision_cli_responses.md"
 DOC_ASSET_SUFFIXES = {
     ".pdf",
     ".docx",
@@ -175,6 +181,18 @@ class EnrichedChunk:
     images: List[ImageAsset]
 
 
+class VisionImageAnalysis(BaseModel):
+    image_index: int
+    asset_ref: str
+    summary: str = ""
+    ocr_text: str = ""
+    relevance: str | bool = ""
+
+
+class VisionAnalysisResponse(BaseModel):
+    images: List[VisionImageAnalysis]
+
+
 def dedupe_preserve_order(values: List[str]) -> List[str]:
     seen: Set[str] = set()
     deduped: List[str] = []
@@ -190,6 +208,15 @@ def truncate_text(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 3].rstrip() + "..."
+
+
+def clean_structured_response(content: str) -> str:
+    cleaned = content.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+
+    return cleaned.strip()
 
 
 def slugify(value: str) -> str:
@@ -516,19 +543,26 @@ class VisionRAGCLI:
         documents_root: str = "documents",
         cache_dir: str = DEFAULT_CACHE_DIR,
         limit: int = 4,
+        provider: str = "groq",
         vision_mode: str = "auto",
         max_vision_images: int = 3,
         chunk_max_tokens: int = DEFAULT_HYBRID_MAX_TOKENS,
         merge_peers: bool = DEFAULT_HYBRID_MERGE_PEERS,
+        responses_md: str = DEFAULT_RESPONSES_MD,
     ):
         self.documents_root = Path(documents_root).resolve()
         self.scope_root = self.documents_root.parent if self.documents_root.is_file() else self.documents_root
         self.cache_dir = cache_dir
         self.limit = limit
+        self.provider = provider
         self.vision_mode = vision_mode
         self.max_vision_images = max_vision_images
         self.chunk_max_tokens = chunk_max_tokens
         self.merge_peers = merge_peers
+        self.responses_md_path = Path(responses_md).resolve()
+        self.responses_md_path.parent.mkdir(parents=True, exist_ok=True)
+        self.session_started_at = datetime.now().astimezone()
+        self.responses_session_logged = False
         self.cwd = Path.cwd().resolve()
         self.discovered_documents = self._discover_documents()
         self.allowed_sources, self.allowed_file_paths = self._build_document_scope_values()
@@ -540,9 +574,19 @@ class VisionRAGCLI:
             chunk_max_tokens=chunk_max_tokens,
             merge_peers=merge_peers,
         )
-        self.groq_client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
-        self.text_model = os.getenv("LLM_CHOICE", DEFAULT_LLM_MODEL)
-        self.vision_model = os.getenv("GROQ_VISION_MODEL", DEFAULT_VISION_MODEL)
+        self.groq_client: Optional[AsyncGroq] = None
+        self.ollama_client: Optional[AsyncClient] = None
+        self.ollama_host = os.getenv("OLLAMA_HOST", DEFAULT_OLLAMA_HOST)
+        self.ollama_num_ctx = int(os.getenv("OLLAMA_NUM_CTX", "16384"))
+
+        if self.provider == "groq":
+            self.groq_client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
+            self.text_model = os.getenv("LLM_CHOICE", DEFAULT_LLM_MODEL)
+            self.vision_model = os.getenv("GROQ_VISION_MODEL", DEFAULT_VISION_MODEL)
+        else:
+            self.ollama_client = AsyncClient(host=self.ollama_host)
+            self.text_model = os.getenv("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL)
+            self.vision_model = os.getenv("OLLAMA_VISION_MODEL", self.text_model)
         self.query_count = 0
 
     def _discover_documents(self) -> List[Path]:
@@ -663,6 +707,31 @@ class VisionRAGCLI:
             return True
         except Exception as exc:
             print(f"{Colors.RED}Database connection failed: {exc}{Colors.END}")
+            return False
+
+    async def check_provider(self) -> bool:
+        if self.provider == "groq":
+            if not os.getenv("GROQ_API_KEY"):
+                print(f"{Colors.RED}GROQ_API_KEY environment variable is required{Colors.END}")
+                return False
+            return True
+
+        try:
+            assert self.ollama_client is not None
+            models_to_check = dedupe_preserve_order([self.text_model, self.vision_model])
+            for model_name in models_to_check:
+                await self.ollama_client.show(model_name)
+
+            print(
+                f"{Colors.GREEN}Ollama ready at {self.ollama_host} "
+                f"with model(s): {', '.join(models_to_check)}{Colors.END}"
+            )
+            return True
+        except ResponseError as exc:
+            print(f"{Colors.RED}Ollama model check failed: {exc.error}{Colors.END}")
+            return False
+        except Exception as exc:
+            print(f"{Colors.RED}Ollama connection failed: {exc}{Colors.END}")
             return False
 
     async def retrieve_chunks(self, query: str, limit: Optional[int] = None) -> List[RetrievedChunk]:
@@ -815,6 +884,11 @@ class VisionRAGCLI:
         if not images:
             return {}
 
+        if self.provider == "ollama":
+            return await self._analyze_images_ollama(query, images)
+        return await self._analyze_images_groq(query, images)
+
+    async def _analyze_images_groq(self, query: str, images: List[ImageAsset]) -> Dict[str, Dict[str, str]]:
         content_parts: List[Dict[str, Any]] = []
         registry_lines = [
             "You are analyzing document figures for retrieval-augmented QA.",
@@ -843,6 +917,7 @@ class VisionRAGCLI:
             )
 
         try:
+            assert self.groq_client is not None
             response = await self.groq_client.chat.completions.create(
                 model=self.vision_model,
                 messages=[{"role": "user", "content": content_parts}],
@@ -871,6 +946,71 @@ class VisionRAGCLI:
                 "summary": str(item.get("summary", "")).strip(),
                 "ocr_text": str(item.get("ocr_text", "")).strip(),
                 "relevance": str(item.get("relevance", "")).strip(),
+            }
+
+        return notes_by_ref
+
+    async def _analyze_images_ollama(self, query: str, images: List[ImageAsset]) -> Dict[str, Dict[str, str]]:
+        registry_lines = [
+            "You are analyzing document figures for retrieval-augmented QA.",
+            f"User question: {query}",
+            "Return a JSON object with an 'images' array.",
+            "Each item must include: image_index, asset_ref, summary, ocr_text, relevance.",
+            "Use exact OCR text when it is visible. Keep summaries concise.",
+            "The asset_ref must exactly match one of the registered assets below.",
+            "",
+            "Image registry:",
+        ]
+
+        for index, image in enumerate(images, start=1):
+            registry_lines.append(
+                f"{index}. asset_ref={image.asset_ref}, page={image.page_no or 'unknown'}, caption={image.caption or 'none'}"
+            )
+
+        image_payloads = await asyncio.gather(
+            *(
+                asyncio.to_thread(self.prepare_image_for_ollama, image.file_path)
+                for image in images
+            )
+        )
+
+        try:
+            assert self.ollama_client is not None
+            response = await self.ollama_client.chat(
+                model=self.vision_model,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": "\n".join(registry_lines),
+                        "images": image_payloads,
+                    }
+                ],
+                format=VisionAnalysisResponse.model_json_schema(),
+                options={
+                    "temperature": 0,
+                    "num_ctx": min(self.ollama_num_ctx, 8192),
+                },
+                think=False,
+            )
+            content = clean_structured_response(response.message.content or "{}")
+            if content.startswith("["):
+                content = json.dumps({"images": json.loads(content)})
+            parsed = VisionAnalysisResponse.model_validate_json(content)
+        except (ResponseError, ValidationError, json.JSONDecodeError, ValueError) as exc:
+            logger.warning("Vision analysis failed: %s", exc)
+            return {}
+        except Exception as exc:
+            logger.warning("Vision analysis failed: %s", exc)
+            return {}
+
+        notes_by_ref: Dict[str, Dict[str, str]] = {}
+        for item in parsed.images:
+            if not item.asset_ref:
+                continue
+            notes_by_ref[item.asset_ref] = {
+                "summary": item.summary.strip(),
+                "ocr_text": item.ocr_text.strip(),
+                "relevance": str(item.relevance).strip(),
             }
 
         return notes_by_ref
@@ -906,6 +1046,37 @@ class VisionRAGCLI:
 
         encoded = base64.b64encode(payload).decode("utf-8")
         return f"data:image/jpeg;base64,{encoded}"
+
+    def prepare_image_for_ollama(self, image_path: Path) -> bytes:
+        with Image.open(image_path) as img:
+            image = img.convert("RGB")
+            max_pixels = 30_000_000
+            total_pixels = image.width * image.height
+            if total_pixels > max_pixels:
+                scale = (max_pixels / total_pixels) ** 0.5
+                resized = (
+                    max(1, int(image.width * scale)),
+                    max(1, int(image.height * scale)),
+                )
+                image = image.resize(resized)
+
+            quality = 90
+            while True:
+                buffer = BytesIO()
+                image.save(buffer, format="JPEG", quality=quality, optimize=True)
+                payload = buffer.getvalue()
+                if len(payload) <= 3_500_000 or quality <= 45:
+                    break
+
+                quality -= 15
+                image = image.resize(
+                    (
+                        max(1, int(image.width * 0.9)),
+                        max(1, int(image.height * 0.9)),
+                    )
+                )
+
+        return payload
 
     def build_context(
         self,
@@ -957,9 +1128,106 @@ class VisionRAGCLI:
 
         return "\n".join(sections).strip()
 
+    async def generate_answer(self, system_prompt: str, context: str) -> str:
+        user_prompt = (
+            "Answer the following question using only the retrieved context.\n\n"
+            f"{context}\n\n"
+            "Give a direct answer first, then concise source citations. "
+            "If support is partial or missing, explicitly say so instead of filling gaps."
+        )
+
+        if self.provider == "ollama":
+            assert self.ollama_client is not None
+            response = await self.ollama_client.chat(
+                model=self.text_model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                options={
+                    "temperature": 0,
+                    "num_ctx": self.ollama_num_ctx,
+                    "num_predict": 1200,
+                },
+                think=False,
+            )
+            return (response.message.content or "No answer returned.").strip()
+
+        assert self.groq_client is not None
+        response = await self.groq_client.chat.completions.create(
+            model=self.text_model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.2,
+            max_completion_tokens=1200,
+        )
+        return (response.choices[0].message.content or "No answer returned.").strip()
+
+    def append_response_markdown(
+        self,
+        query: str,
+        answer: str,
+        enriched_chunks: List[EnrichedChunk],
+        used_vision: bool,
+    ) -> None:
+        timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        unique_sources = dedupe_preserve_order([item.chunk.document_title for item in enriched_chunks])
+        linked_tables = sum(len(item.tables) for item in enriched_chunks)
+        linked_images = sum(len(item.images) for item in enriched_chunks)
+
+        if not self.responses_md_path.exists():
+            self.responses_md_path.write_text("# Vision CLI Responses\n\n", encoding="utf-8")
+
+        if not self.responses_session_logged:
+            header = (
+                f"### Session {self.session_started_at.isoformat(timespec='seconds')}\n\n"
+                f"- Provider: {self.provider}\n"
+                f"- Text model: {self.text_model}\n"
+                f"- Vision model: {self.vision_model}\n"
+                f"- Scope: {self.documents_root}\n\n"
+            )
+            with self.responses_md_path.open("a", encoding="utf-8") as handle:
+                handle.write(header)
+            self.responses_session_logged = True
+
+        chunk_lines = []
+        for item in enriched_chunks:
+            pages = ", ".join(map(str, item.page_numbers)) if item.page_numbers else "unknown"
+            modality = chunk_modality(item.chunk.chunk_metadata) or "text"
+            chunk_lines.append(
+                f"- {item.chunk.document_title} | chunk={item.chunk.chunk_index} | "
+                f"similarity={item.chunk.similarity:.3f} | pages={pages} | modality={modality}"
+            )
+
+        context_block = (
+            f"- Timestamp: {timestamp}\n"
+            f"- Provider: {self.provider}\n"
+            f"- Text model: {self.text_model}\n"
+            f"- Vision model: {self.vision_model}\n"
+            f"- Vision used: {used_vision}\n"
+            f"- Sources: {', '.join(unique_sources) if unique_sources else 'none'}\n"
+            f"- Linked tables: {linked_tables}\n"
+            f"- Linked images: {linked_images}\n"
+        )
+        if chunk_lines:
+            context_block += "- Retrieved chunks:\n" + "\n".join(chunk_lines) + "\n"
+
+        entry = (
+            f"## Query {self.query_count}\n\n"
+            f"Q: {query}\n\n"
+            f"A:\n{answer}\n\n"
+            f"Context:\n{context_block}\n"
+        )
+
+        with self.responses_md_path.open("a", encoding="utf-8") as handle:
+            handle.write(entry)
+
     async def answer_question(self, query: str) -> tuple[str, List[EnrichedChunk], bool]:
         chunks = await self.retrieve_chunks(query)
         if not chunks:
+            self.query_count += 1
             return (
                 "No relevant information was found in the knowledge base for that question.",
                 [],
@@ -988,25 +1256,7 @@ class VisionRAGCLI:
             "Include page numbers in citations when available using the format [Document Title p.X]."
         )
 
-        response = await self.groq_client.chat.completions.create(
-            model=self.text_model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {
-                    "role": "user",
-                    "content": (
-                        "Answer the following question using only the retrieved context.\n\n"
-                        f"{context}\n\n"
-                        "Give a direct answer first, then concise source citations. "
-                        "If support is partial or missing, explicitly say so instead of filling gaps."
-                    ),
-                },
-            ],
-            temperature=0.2,
-            max_completion_tokens=1200,
-        )
-
-        answer = response.choices[0].message.content or "No answer returned."
+        answer = await self.generate_answer(system_prompt, context)
         self.query_count += 1
         return answer.strip(), enriched_chunks, use_vision
 
@@ -1014,11 +1264,15 @@ class VisionRAGCLI:
         print(f"\n{Colors.CYAN}{Colors.BOLD}{'=' * 64}")
         print("Docling Vision RAG Assistant")
         print("=" * 64)
+        print(f"Provider:     {self.provider}")
         print(f"Text model:   {self.text_model}")
         print(f"Vision model: {self.vision_model}")
+        if self.provider == "ollama":
+            print(f"Ollama host:  {self.ollama_host}")
         print(f"Vision mode:  {self.vision_mode}")
         print(f"Chunking:     max_tokens={self.chunk_max_tokens}, merge_peers={self.merge_peers}")
         print(f"Cache dir:    {self.cache_dir}")
+        print(f"Responses MD: {self.responses_md_path}")
         print(f"Scope:        {self.documents_root}")
         print("=" * 64 + f"{Colors.END}\n")
 
@@ -1036,7 +1290,8 @@ class VisionRAGCLI:
   - Rebuilds linked tables and nearby figures from source docs on demand
   - Reuses the ingestion chunking shape for figure/table linking
   - Uses table markdown directly
-  - Calls Groq vision according to the configured mode
+  - Uses the selected provider for text and optional vision reasoning
+  - Appends each question/answer/context summary to the configured markdown file
 """
         print(help_text)
 
@@ -1076,6 +1331,8 @@ class VisionRAGCLI:
         self.print_banner()
         if not await self.check_database():
             return
+        if not await self.check_provider():
+            return
 
         while True:
             try:
@@ -1105,6 +1362,7 @@ class VisionRAGCLI:
                 continue
 
             print(f"\n{Colors.GREEN}Assistant:{Colors.END} {answer}\n")
+            self.append_response_markdown(user_input, answer, enriched_chunks, used_vision)
 
             unique_sources = dedupe_preserve_order(
                 [item.chunk.document_title for item in enriched_chunks]
@@ -1128,6 +1386,12 @@ def parse_args() -> argparse.Namespace:
         help="Root folder for original source documents",
     )
     parser.add_argument(
+        "--provider",
+        choices=["groq", "ollama"],
+        default=os.getenv("VISION_PROVIDER", "groq"),
+        help="LLM provider to use for answering and vision analysis",
+    )
+    parser.add_argument(
         "--cache-dir",
         default=DEFAULT_CACHE_DIR,
         help="Folder used for extracted markdown and image artifacts",
@@ -1142,7 +1406,7 @@ def parse_args() -> argparse.Namespace:
         "--vision-mode",
         choices=["auto", "always", "off"],
         default="auto",
-        help="When to call the Groq vision model",
+        help="When to call the provider vision model",
     )
     parser.add_argument(
         "--chunk-max-tokens",
@@ -1159,7 +1423,12 @@ def parse_args() -> argparse.Namespace:
         "--max-vision-images",
         type=int,
         default=3,
-        help="Maximum number of linked images to send to Groq vision per query",
+        help="Maximum number of linked images to send to the provider vision model per query",
+    )
+    parser.add_argument(
+        "--responses-md",
+        default=DEFAULT_RESPONSES_MD,
+        help="Markdown file used to append question, answer, and context summaries",
     )
     parser.add_argument(
         "--verbose",
@@ -1182,18 +1451,16 @@ async def main() -> None:
         logger.error("DATABASE_URL environment variable is required")
         sys.exit(1)
 
-    if not os.getenv("GROQ_API_KEY"):
-        logger.error("GROQ_API_KEY environment variable is required")
-        sys.exit(1)
-
     cli = VisionRAGCLI(
         documents_root=args.documents_root,
         cache_dir=args.cache_dir,
         limit=args.limit,
+        provider=args.provider,
         vision_mode=args.vision_mode,
         chunk_max_tokens=args.chunk_max_tokens,
         merge_peers=args.merge_peers,
         max_vision_images=args.max_vision_images,
+        responses_md=args.responses_md,
     )
 
     try:
