@@ -16,7 +16,7 @@ Benefits over custom chunking:
 
 import os
 import logging
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set
 from dataclasses import dataclass
 
 from dotenv import load_dotenv
@@ -32,6 +32,73 @@ logger = logging.getLogger(__name__)
 DEFAULT_HYBRID_TOKENIZER = "sentence-transformers/all-MiniLM-L6-v2"
 DEFAULT_HYBRID_MAX_TOKENS = 256
 DEFAULT_HYBRID_MERGE_PEERS = False
+
+
+def dedupe_preserve_order(values: List[str]) -> List[str]:
+    seen: Set[str] = set()
+    deduped: List[str] = []
+    for value in values:
+        if value and value not in seen:
+            seen.add(value)
+            deduped.append(value)
+    return deduped
+
+
+def extract_page_numbers(doc_item: Any) -> List[int]:
+    page_numbers: List[int] = []
+    for prov in getattr(doc_item, "prov", []) or []:
+        page_no = getattr(prov, "page_no", None)
+        if page_no is not None:
+            page_numbers.append(page_no)
+    return sorted(set(page_numbers))
+
+
+def build_order_entries(docling_doc: DoclingDocument) -> List[Dict[str, Any]]:
+    order_entries: List[Dict[str, Any]] = []
+    for order_index, (element, _level) in enumerate(docling_doc.iterate_items()):
+        element_ref = getattr(element, "self_ref", None)
+        if not element_ref:
+            continue
+
+        label = getattr(getattr(element, "label", None), "value", "")
+        order_entries.append(
+            {
+                "index": order_index,
+                "ref": element_ref,
+                "label": label,
+                "pages": extract_page_numbers(element),
+            }
+        )
+    return order_entries
+
+
+def find_nearby_asset_refs(
+    order_entries: List[Dict[str, Any]],
+    positions: List[int],
+    page_numbers: Set[int],
+    asset_label: str,
+    max_results: int,
+    window: int,
+) -> List[str]:
+    if not positions:
+        return []
+
+    start = max(0, min(positions) - window)
+    end = min(len(order_entries), max(positions) + window + 1)
+
+    refs: List[str] = []
+    for entry in order_entries[start:end]:
+        if entry["label"] != asset_label:
+            continue
+
+        if page_numbers and entry["pages"] and not set(entry["pages"]).intersection(page_numbers):
+            continue
+
+        refs.append(entry["ref"])
+        if len(refs) >= max_results:
+            break
+
+    return refs
 
 
 @dataclass
@@ -155,6 +222,8 @@ class DoclingHybridChunker:
             # Use HybridChunker to chunk the DoclingDocument
             chunk_iter = self.chunker.chunk(dl_doc=docling_doc)
             chunks = list(chunk_iter)
+            order_entries = build_order_entries(docling_doc)
+            order_index = {entry["ref"]: entry["index"] for entry in order_entries}
 
             # Convert Docling chunks to DocumentChunk objects
             document_chunks = []
@@ -167,12 +236,58 @@ class DoclingHybridChunker:
                 # Count actual tokens
                 token_count = len(self.tokenizer.encode(contextualized_text))
 
+                positions: List[int] = []
+                page_numbers: Set[int] = set()
+                direct_table_refs: List[str] = []
+                direct_image_refs: List[str] = []
+                for doc_item in chunk.meta.doc_items:
+                    item_ref = getattr(doc_item, "self_ref", None)
+                    if item_ref in order_index:
+                        positions.append(order_index[item_ref])
+                    label = getattr(getattr(doc_item, "label", None), "value", "")
+                    if label == "table" and item_ref:
+                        direct_table_refs.append(item_ref)
+                    elif label == "picture" and item_ref:
+                        direct_image_refs.append(item_ref)
+                    page_numbers.update(extract_page_numbers(doc_item))
+
+                table_refs = dedupe_preserve_order(direct_table_refs)
+                if not table_refs:
+                    table_refs.extend(
+                        find_nearby_asset_refs(
+                            order_entries,
+                            positions,
+                            page_numbers,
+                            asset_label="table",
+                            max_results=1,
+                            window=4,
+                        )
+                    )
+
+                image_refs = dedupe_preserve_order(direct_image_refs)
+                if not image_refs:
+                    image_refs.extend(
+                        find_nearby_asset_refs(
+                            order_entries,
+                            positions,
+                            page_numbers,
+                            asset_label="picture",
+                            max_results=2,
+                            window=6,
+                        )
+                    )
+
                 # Create chunk metadata
                 chunk_metadata = {
                     **base_metadata,
                     "total_chunks": len(chunks),
                     "token_count": token_count,
-                    "has_context": True  # Flag indicating contextualized chunk
+                    "has_context": True,  # Flag indicating contextualized chunk
+                    "page_numbers": sorted(page_numbers),
+                    "direct_table_refs": dedupe_preserve_order(direct_table_refs),
+                    "direct_image_refs": dedupe_preserve_order(direct_image_refs),
+                    "table_refs": dedupe_preserve_order(table_refs),
+                    "image_refs": dedupe_preserve_order(image_refs),
                 }
 
                 # Estimate character positions

@@ -27,7 +27,6 @@ import asyncpg
 from dotenv import load_dotenv
 from groq import AsyncGroq
 from ollama import AsyncClient, ResponseError
-from pydantic import BaseModel, ValidationError
 from PIL import Image
 from transformers import AutoTokenizer
 
@@ -90,9 +89,23 @@ VISION_QUERY_HINTS = (
     "visual",
     "see",
     "shown",
-    "ocr",
     "read the image",
     "read the chart",
+)
+OCR_READOUT_HINTS = (
+    "read the image",
+    "read this image",
+    "read the figure",
+    "read this figure",
+    "read the screenshot",
+    "extract text",
+    "extract the text",
+    "transcribe",
+    "ocr text",
+    "exact text",
+    "verbatim",
+    "what does the page say",
+    "what does the scan say",
 )
 QUERY_STOPWORDS = {
     "the",
@@ -160,7 +173,9 @@ class ImageAsset:
 @dataclass
 class ChunkAssetLinks:
     page_numbers: List[int] = field(default_factory=list)
+    direct_table_refs: List[str] = field(default_factory=list)
     table_refs: List[str] = field(default_factory=list)
+    direct_image_refs: List[str] = field(default_factory=list)
     image_refs: List[str] = field(default_factory=list)
 
 
@@ -179,19 +194,16 @@ class EnrichedChunk:
     markdown_path: Optional[Path]
     page_numbers: List[int]
     tables: List[TableAsset]
-    images: List[ImageAsset]
+    images: List["LinkedImage"]
 
 
-class VisionImageAnalysis(BaseModel):
-    image_index: int
-    asset_ref: str
-    summary: str = ""
-    ocr_text: str = ""
-    relevance: str | bool = ""
-
-
-class VisionAnalysisResponse(BaseModel):
-    images: List[VisionImageAnalysis]
+@dataclass
+class LinkedImage:
+    image: ImageAsset
+    match_source: str
+    context_excerpt: str = ""
+    source_chunk_index: Optional[int] = None
+    relevance_score: float = 0.0
 
 
 def dedupe_preserve_order(values: List[str]) -> List[str]:
@@ -252,6 +264,14 @@ def extract_metadata_pages(metadata: Dict[str, Any]) -> List[int]:
     return sorted(set(pages))
 
 
+def extract_metadata_refs(metadata: Dict[str, Any], key: str) -> List[str]:
+    values = metadata.get(key)
+    if not isinstance(values, list):
+        return []
+    refs = [str(value).strip() for value in values if str(value).strip()]
+    return dedupe_preserve_order(refs)
+
+
 def chunk_modality(metadata: Dict[str, Any]) -> str:
     return str(metadata.get("source_modality") or metadata.get("chunk_method") or "").strip()
 
@@ -285,7 +305,26 @@ def extract_page_numbers(item: Any) -> List[int]:
 
 def question_needs_vision(question: str) -> bool:
     normalized = question.lower()
-    return any(hint in normalized for hint in VISION_QUERY_HINTS)
+    return any(
+        (
+            hint in normalized
+            if " " in hint
+            else re.search(rf"\b{re.escape(hint)}\b", normalized) is not None
+        )
+        for hint in VISION_QUERY_HINTS
+    )
+
+
+def question_requests_page_readout(question: str) -> bool:
+    normalized = question.lower()
+    return any(
+        (
+            hint in normalized
+            if " " in hint
+            else re.search(rf"\b{re.escape(hint)}\b", normalized) is not None
+        )
+        for hint in OCR_READOUT_HINTS
+    )
 
 
 def extract_query_terms(query: str) -> List[str]:
@@ -303,6 +342,44 @@ def extract_query_phrases(query_terms: List[str]) -> List[str]:
         for index in range(len(query_terms) - n + 1):
             phrases.append(" ".join(query_terms[index:index + n]))
     return phrases
+
+
+def extract_json_block(content: str) -> Optional[str]:
+    cleaned = clean_structured_response(content)
+    if not cleaned:
+        return None
+
+    for opening, closing in (("{", "}"), ("[", "]")):
+        start = cleaned.find(opening)
+        if start == -1:
+            continue
+
+        depth = 0
+        in_string = False
+        escape = False
+        for index in range(start, len(cleaned)):
+            char = cleaned[index]
+            if in_string:
+                if escape:
+                    escape = False
+                elif char == "\\":
+                    escape = True
+                elif char == '"':
+                    in_string = False
+                continue
+
+            if char == '"':
+                in_string = True
+                continue
+
+            if char == opening:
+                depth += 1
+            elif char == closing:
+                depth -= 1
+                if depth == 0:
+                    return cleaned[start:index + 1]
+
+    return None
 
 
 class DoclingAssetManager:
@@ -461,8 +538,8 @@ class DoclingAssetManager:
         for chunk_index, chunk in enumerate(self.chunker.chunk(dl_doc=document)):
             positions: List[int] = []
             page_numbers: Set[int] = set()
-            table_refs: List[str] = []
-            image_refs: List[str] = []
+            direct_table_refs: List[str] = []
+            direct_image_refs: List[str] = []
 
             for doc_item in chunk.meta.doc_items:
                 item_ref = getattr(doc_item, "self_ref", None)
@@ -471,12 +548,13 @@ class DoclingAssetManager:
 
                 label = getattr(getattr(doc_item, "label", None), "value", "")
                 if label == "table":
-                    table_refs.append(item_ref)
+                    direct_table_refs.append(item_ref)
                 elif label == "picture":
-                    image_refs.append(item_ref)
+                    direct_image_refs.append(item_ref)
 
                 page_numbers.update(extract_page_numbers(doc_item))
 
+            table_refs = dedupe_preserve_order(direct_table_refs)
             if not table_refs:
                 table_refs.extend(
                     self._find_nearby_asset_refs(
@@ -489,6 +567,7 @@ class DoclingAssetManager:
                     )
                 )
 
+            image_refs = dedupe_preserve_order(direct_image_refs)
             if not image_refs:
                 image_refs.extend(
                     self._find_nearby_asset_refs(
@@ -503,7 +582,9 @@ class DoclingAssetManager:
 
             chunk_links[chunk_index] = ChunkAssetLinks(
                 page_numbers=sorted(page_numbers),
+                direct_table_refs=dedupe_preserve_order(direct_table_refs),
                 table_refs=dedupe_preserve_order(table_refs),
+                direct_image_refs=dedupe_preserve_order(direct_image_refs),
                 image_refs=dedupe_preserve_order(image_refs),
             )
 
@@ -651,9 +732,49 @@ class VisionRAGCLI:
 
         return "(" + " OR ".join(clauses) + ")", params, current_index
 
+    def _links_from_chunk_metadata(self, metadata: Dict[str, Any]) -> ChunkAssetLinks:
+        return ChunkAssetLinks(
+            page_numbers=extract_metadata_pages(metadata),
+            direct_table_refs=extract_metadata_refs(metadata, "direct_table_refs"),
+            table_refs=extract_metadata_refs(metadata, "table_refs"),
+            direct_image_refs=extract_metadata_refs(metadata, "direct_image_refs"),
+            image_refs=extract_metadata_refs(metadata, "image_refs"),
+        )
+
+    def _limit_ocr_chunks(self, chunks: List[RetrievedChunk], limit: int) -> List[RetrievedChunk]:
+        max_ocr_chunks = max(1, limit // 3)
+        selected: List[RetrievedChunk] = []
+        selected_ids: Set[str] = set()
+        ocr_count = 0
+
+        for chunk in chunks:
+            if len(selected) >= limit:
+                break
+
+            is_ocr_chunk = chunk_modality(chunk.chunk_metadata) == "ocr_page"
+            if is_ocr_chunk and ocr_count >= max_ocr_chunks:
+                continue
+
+            selected.append(chunk)
+            selected_ids.add(chunk.chunk_id)
+            if is_ocr_chunk:
+                ocr_count += 1
+
+        if len(selected) < limit:
+            for chunk in chunks:
+                if len(selected) >= limit:
+                    break
+                if chunk.chunk_id in selected_ids:
+                    continue
+                selected.append(chunk)
+                selected_ids.add(chunk.chunk_id)
+
+        return selected
+
     def _rerank_chunks(self, query: str, chunks: List[RetrievedChunk], limit: int) -> List[RetrievedChunk]:
         query_terms = extract_query_terms(query)
         query_phrases = extract_query_phrases(query_terms)
+        page_readout_query = question_requests_page_readout(query)
 
         def score(chunk: RetrievedChunk) -> float:
             content = chunk.content.lower()
@@ -662,10 +783,18 @@ class VisionRAGCLI:
             modality = chunk_modality(chunk.chunk_metadata)
             modality_boost = 0.0
             if modality == "ocr_page":
-                modality_boost = 0.05 * min(term_hits, 3)
+                if page_readout_query:
+                    modality_boost = 0.08 + (0.05 * min(term_hits, 3))
+                else:
+                    modality_boost = -0.12
+            elif modality and not page_readout_query:
+                modality_boost = 0.05
             return chunk.similarity + (0.04 * term_hits) + (0.1 * phrase_hits) + modality_boost
 
-        return sorted(chunks, key=score, reverse=True)[:limit]
+        ranked = sorted(chunks, key=score, reverse=True)
+        if page_readout_query:
+            return ranked[:limit]
+        return self._limit_ocr_chunks(ranked, limit)
 
     async def initialize_db(self) -> None:
         if self.db_pool is None:
@@ -815,25 +944,60 @@ class VisionRAGCLI:
             source_path = self.resolve_source_path(chunk)
             markdown_path: Optional[Path] = None
             linked_tables: List[TableAsset] = []
-            linked_images: List[ImageAsset] = []
+            linked_images: List[LinkedImage] = []
             page_numbers = extract_metadata_pages(chunk.chunk_metadata)
 
             if source_path and supports_docling_assets(source_path):
                 catalog = await self.asset_manager.get_catalog(source_path)
                 if catalog is not None:
                     markdown_path = catalog.markdown_path
-                    links = catalog.chunk_links.get(chunk.chunk_index, ChunkAssetLinks())
+                    metadata_links = self._links_from_chunk_metadata(chunk.chunk_metadata)
+                    links = metadata_links
+                    if not (
+                        metadata_links.direct_table_refs
+                        or metadata_links.table_refs
+                        or metadata_links.direct_image_refs
+                        or metadata_links.image_refs
+                        or metadata_links.page_numbers
+                    ):
+                        links = catalog.chunk_links.get(chunk.chunk_index, ChunkAssetLinks())
                     page_numbers = links.page_numbers or page_numbers
-                    linked_tables = [
-                        catalog.tables[asset_ref]
-                        for asset_ref in links.table_refs
-                        if asset_ref in catalog.tables
-                    ][:2]
-                    linked_images = [
-                        catalog.images[asset_ref]
-                        for asset_ref in links.image_refs
-                        if asset_ref in catalog.images
-                    ][:2]
+                    if links.direct_table_refs:
+                        linked_tables = [
+                            catalog.tables[asset_ref]
+                            for asset_ref in links.direct_table_refs
+                            if asset_ref in catalog.tables
+                        ][:2]
+                    elif links.table_refs:
+                        linked_tables = [
+                            catalog.tables[asset_ref]
+                            for asset_ref in links.table_refs
+                            if asset_ref in catalog.tables
+                        ][:2]
+
+                    context_excerpt = truncate_text(chunk.content, 900)
+                    if links.direct_image_refs:
+                        linked_images = [
+                            LinkedImage(
+                                image=catalog.images[asset_ref],
+                                match_source="direct_chunk",
+                                context_excerpt=context_excerpt,
+                                source_chunk_index=chunk.chunk_index,
+                            )
+                            for asset_ref in links.direct_image_refs
+                            if asset_ref in catalog.images
+                        ][:2]
+                    elif links.image_refs:
+                        linked_images = [
+                            LinkedImage(
+                                image=catalog.images[asset_ref],
+                                match_source="nearby_chunk",
+                                context_excerpt=context_excerpt,
+                                source_chunk_index=chunk.chunk_index,
+                            )
+                            for asset_ref in links.image_refs
+                            if asset_ref in catalog.images
+                        ][:2]
                     if not linked_tables and page_numbers:
                         linked_tables = [
                             table
@@ -842,7 +1006,12 @@ class VisionRAGCLI:
                         ][:2]
                     if not linked_images and page_numbers:
                         linked_images = [
-                            image
+                            LinkedImage(
+                                image=image,
+                                match_source="page_fallback",
+                                context_excerpt=context_excerpt,
+                                source_chunk_index=chunk.chunk_index,
+                            )
                             for image in catalog.images.values()
                             if image.page_no in page_numbers
                         ][:2]
@@ -872,22 +1041,74 @@ class VisionRAGCLI:
 
         return question_needs_vision(query)
 
-    def collect_images_for_vision(self, enriched_chunks: List[EnrichedChunk]) -> List[ImageAsset]:
-        images: List[ImageAsset] = []
-        seen: Set[str] = set()
+    def _score_linked_image(
+        self,
+        query: str,
+        chunk: RetrievedChunk,
+        linked_image: LinkedImage,
+    ) -> float:
+        query_terms = extract_query_terms(query)
+        query_phrases = extract_query_phrases(query_terms)
+        caption = linked_image.image.caption.lower()
+        context = linked_image.context_excerpt.lower()
+        haystack = "\n".join(part for part in [caption, context] if part)
+        term_hits = sum(1 for term in set(query_terms) if term in haystack)
+        phrase_hits = sum(1 for phrase in set(query_phrases) if phrase in haystack)
 
-        for chunk in enriched_chunks:
-            for image in chunk.images:
-                if image.asset_ref in seen:
-                    continue
-                seen.add(image.asset_ref)
-                images.append(image)
-                if len(images) >= self.max_vision_images:
-                    return images
+        match_boost = {
+            "direct_chunk": 0.45,
+            "nearby_chunk": 0.2,
+            "page_fallback": 0.05,
+        }.get(linked_image.match_source, 0.0)
 
-        return images
+        score = chunk.similarity + match_boost
+        score += 0.05 * term_hits
+        score += 0.15 * phrase_hits
+        if linked_image.image.caption:
+            score += 0.08
+        if any(
+            token in haystack
+            for token in (
+                "figure",
+                "diagram",
+                "architecture",
+                "pipeline",
+                "workflow",
+                "chart",
+                "graph",
+                "example",
+                "overview",
+                "schema",
+            )
+        ):
+            score += 0.15
+        if linked_image.match_source == "page_fallback" and not linked_image.image.caption:
+            score -= 0.08
+        return score
 
-    async def analyze_images(self, query: str, images: List[ImageAsset]) -> Dict[str, Dict[str, str]]:
+    def collect_images_for_vision(self, query: str, enriched_chunks: List[EnrichedChunk]) -> List[LinkedImage]:
+        best_by_ref: Dict[str, LinkedImage] = {}
+
+        for item in enriched_chunks:
+            for linked_image in item.images:
+                linked_image.relevance_score = self._score_linked_image(query, item.chunk, linked_image)
+                asset_ref = linked_image.image.asset_ref
+                existing = best_by_ref.get(asset_ref)
+                if existing is None or linked_image.relevance_score > existing.relevance_score:
+                    best_by_ref[asset_ref] = linked_image
+
+        ranked_images = sorted(
+            best_by_ref.values(),
+            key=lambda image: (
+                image.relevance_score,
+                image.match_source == "direct_chunk",
+                bool(image.image.caption),
+            ),
+            reverse=True,
+        )
+        return ranked_images[: self.max_vision_images]
+
+    async def analyze_images(self, query: str, images: List[LinkedImage]) -> Dict[str, Dict[str, str]]:
         if not images:
             return {}
 
@@ -895,25 +1116,34 @@ class VisionRAGCLI:
             return await self._analyze_images_ollama(query, images)
         return await self._analyze_images_groq(query, images)
 
-    async def _analyze_images_groq(self, query: str, images: List[ImageAsset]) -> Dict[str, Dict[str, str]]:
+    async def _analyze_images_groq(self, query: str, images: List[LinkedImage]) -> Dict[str, Dict[str, str]]:
         content_parts: List[Dict[str, Any]] = []
         registry_lines = [
             "You are analyzing document figures for retrieval-augmented QA.",
             f"User question: {query}",
             "Return a JSON object with an 'images' array.",
             "Each item must include: image_index, asset_ref, summary, ocr_text, relevance.",
+            "Prefer images directly linked to the retrieved chunk over nearby page-level images.",
             "Use exact OCR text when it is visible. Keep summaries concise.",
             "",
             "Image registry:",
         ]
 
-        for index, image in enumerate(images, start=1):
+        for index, linked_image in enumerate(images, start=1):
+            image = linked_image.image
             registry_lines.append(
-                f"{index}. asset_ref={image.asset_ref}, page={image.page_no or 'unknown'}, caption={image.caption or 'none'}"
+                f"{index}. asset_ref={image.asset_ref}, page={image.page_no or 'unknown'}, "
+                f"match_source={linked_image.match_source}, score={linked_image.relevance_score:.3f}, "
+                f"caption={image.caption or 'none'}"
             )
+            if linked_image.context_excerpt:
+                registry_lines.append(
+                    f"   related_chunk_excerpt={truncate_text(linked_image.context_excerpt, 320)}"
+                )
 
         content_parts.append({"type": "text", "text": "\n".join(registry_lines)})
-        for image in images:
+        for linked_image in images:
+            image = linked_image.image
             content_parts.append(
                 {
                     "type": "image_url",
@@ -957,68 +1187,90 @@ class VisionRAGCLI:
 
         return notes_by_ref
 
-    async def _analyze_images_ollama(self, query: str, images: List[ImageAsset]) -> Dict[str, Dict[str, str]]:
-        registry_lines = [
-            "You are analyzing document figures for retrieval-augmented QA.",
-            f"User question: {query}",
-            "Return a JSON object with an 'images' array.",
-            "Each item must include: image_index, asset_ref, summary, ocr_text, relevance.",
-            "Use exact OCR text when it is visible. Keep summaries concise.",
-            "The asset_ref must exactly match one of the registered assets below.",
-            "",
-            "Image registry:",
-        ]
-
-        for index, image in enumerate(images, start=1):
-            registry_lines.append(
-                f"{index}. asset_ref={image.asset_ref}, page={image.page_no or 'unknown'}, caption={image.caption or 'none'}"
-            )
-
-        image_payloads = await asyncio.gather(
-            *(
-                asyncio.to_thread(self.prepare_image_for_ollama, image.file_path)
-                for image in images
-            )
-        )
+    def _parse_single_vision_note(
+        self,
+        content: str,
+        fallback_asset_ref: str,
+    ) -> Optional[Dict[str, str]]:
+        json_block = extract_json_block(content)
+        if not json_block:
+            return None
 
         try:
-            assert self.ollama_client is not None
-            response = await self.ollama_client.chat(
-                model=self.vision_model,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": "\n".join(registry_lines),
-                        "images": image_payloads,
-                    }
-                ],
-                format=VisionAnalysisResponse.model_json_schema(),
-                options={
-                    "temperature": 0,
-                    "num_ctx": min(self.ollama_num_ctx, 8192),
-                },
-                think=False,
-            )
-            content = clean_structured_response(response.message.content or "{}")
-            if content.startswith("["):
-                content = json.dumps({"images": json.loads(content)})
-            parsed = VisionAnalysisResponse.model_validate_json(content)
-        except (ResponseError, ValidationError, json.JSONDecodeError, ValueError) as exc:
-            logger.warning("Vision analysis failed: %s", exc)
-            return {}
-        except Exception as exc:
-            logger.warning("Vision analysis failed: %s", exc)
-            return {}
+            parsed = json.loads(json_block)
+        except json.JSONDecodeError:
+            return None
 
+        if isinstance(parsed, list):
+            parsed = parsed[0] if parsed else {}
+        elif isinstance(parsed, dict) and isinstance(parsed.get("images"), list):
+            images = parsed.get("images") or []
+            parsed = images[0] if images else {}
+
+        if not isinstance(parsed, dict):
+            return None
+
+        asset_ref = str(parsed.get("asset_ref") or fallback_asset_ref).strip() or fallback_asset_ref
+        return {
+            "asset_ref": asset_ref,
+            "summary": str(parsed.get("summary", "")).strip(),
+            "ocr_text": str(parsed.get("ocr_text", "")).strip(),
+            "relevance": str(parsed.get("relevance", "")).strip(),
+        }
+
+    async def _analyze_images_ollama(self, query: str, images: List[LinkedImage]) -> Dict[str, Dict[str, str]]:
         notes_by_ref: Dict[str, Dict[str, str]] = {}
-        for item in parsed.images:
-            if not item.asset_ref:
-                continue
-            notes_by_ref[item.asset_ref] = {
-                "summary": item.summary.strip(),
-                "ocr_text": item.ocr_text.strip(),
-                "relevance": str(item.relevance).strip(),
-            }
+        assert self.ollama_client is not None
+
+        for linked_image in images:
+            image = linked_image.image
+            prompt = "\n".join(
+                [
+                    "You are analyzing one document figure for retrieval-augmented QA.",
+                    f"User question: {query}",
+                    f"asset_ref: {image.asset_ref}",
+                    f"page: {image.page_no or 'unknown'}",
+                    f"match_source: {linked_image.match_source}",
+                    f"caption: {image.caption or 'none'}",
+                    f"related_chunk_excerpt: {truncate_text(linked_image.context_excerpt, 420) if linked_image.context_excerpt else 'none'}",
+                    "",
+                    "Return exactly one JSON object with keys:",
+                    "asset_ref, summary, ocr_text, relevance",
+                    "Use a short string for relevance such as yes, partial, or no.",
+                    "Keep summary concise and copy visible text into ocr_text when possible.",
+                ]
+            )
+
+            try:
+                image_payload = await asyncio.to_thread(self.prepare_image_for_ollama, image.file_path)
+                response = await self.ollama_client.chat(
+                    model=self.vision_model,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": prompt,
+                            "images": [image_payload],
+                        }
+                    ],
+                    options={
+                        "temperature": 0,
+                        "num_ctx": min(self.ollama_num_ctx, 4096),
+                    },
+                    think=False,
+                )
+                note = self._parse_single_vision_note(response.message.content or "", image.asset_ref)
+                if note is None:
+                    logger.warning("Vision analysis failed: invalid JSON for %s", image.asset_ref)
+                    continue
+                notes_by_ref[note["asset_ref"]] = {
+                    "summary": note["summary"],
+                    "ocr_text": note["ocr_text"],
+                    "relevance": note["relevance"],
+                }
+            except ResponseError as exc:
+                logger.warning("Vision analysis failed for %s: %s", image.asset_ref, exc.error)
+            except Exception as exc:
+                logger.warning("Vision analysis failed for %s: %s", image.asset_ref, exc)
 
         return notes_by_ref
 
@@ -1090,6 +1342,7 @@ class VisionRAGCLI:
         query: str,
         enriched_chunks: List[EnrichedChunk],
         vision_notes: Dict[str, Dict[str, str]],
+        selected_image_refs: Optional[Set[str]] = None,
     ) -> str:
         sections = [f"User question: {query}", "", "Retrieved knowledge context:"]
 
@@ -1111,25 +1364,27 @@ class VisionRAGCLI:
                     f"{truncate_text(table.markdown, 2500)}"
                 )
 
-            for image in item.images:
+            for linked_image in item.images:
+                image = linked_image.image
                 note = vision_notes.get(image.asset_ref)
+                image_lines = [
+                    (
+                        f"[Linked image {image.asset_ref} | page={image.page_no or 'unknown'} | "
+                        f"match={linked_image.match_source} | score={linked_image.relevance_score:.3f}]"
+                    ),
+                ]
+                if image.caption:
+                    image_lines.append(f"Caption: {image.caption}")
+                if selected_image_refs and image.asset_ref in selected_image_refs and not note:
+                    image_lines.append("Vision analysis: requested but no structured summary was returned.")
                 if note:
-                    image_lines = [
-                        f"[Linked image {image.asset_ref} | page={image.page_no or 'unknown'}]",
-                    ]
-                    if image.caption:
-                        image_lines.append(f"Caption: {image.caption}")
                     if note.get("summary"):
                         image_lines.append(f"Summary: {note['summary']}")
                     if note.get("ocr_text"):
                         image_lines.append(f"OCR: {note['ocr_text']}")
                     if note.get("relevance"):
                         image_lines.append(f"Relevance: {note['relevance']}")
-                    sections.append("\n".join(image_lines))
-                else:
-                    sections.append(
-                        f"[Linked image available {image.asset_ref} | page={image.page_no or 'unknown'} | file={image.file_path.name}]"
-                    )
+                sections.append("\n".join(image_lines))
 
             sections.append("")
 
@@ -1244,15 +1499,21 @@ class VisionRAGCLI:
             )
 
         enriched_chunks = await self.enrich_chunks(chunks)
-        use_vision = self.should_use_vision(query, enriched_chunks)
+        selected_images = self.collect_images_for_vision(query, enriched_chunks)
+        use_vision = self.should_use_vision(query, enriched_chunks) and bool(selected_images)
         vision_notes: Dict[str, Dict[str, str]] = {}
         if use_vision:
             vision_notes = await self.analyze_images(
                 query,
-                self.collect_images_for_vision(enriched_chunks),
+                selected_images,
             )
 
-        context = self.build_context(query, enriched_chunks, vision_notes)
+        context = self.build_context(
+            query,
+            enriched_chunks,
+            vision_notes,
+            selected_image_refs={image.image.asset_ref for image in selected_images},
+        )
         system_prompt = (
             "You answer questions using only retrieved documentation from a private knowledge base. "
             "Never answer from general knowledge or outside assumptions. "

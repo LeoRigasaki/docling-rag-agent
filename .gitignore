@@ -8,3 +8,16 @@ ideal_documents
 PRPs
 .vision_cache
 .vision_cache_test
+
+# Not used by the ingestion/vision_cli command path
+Dockerfile
+docker-compose.yml
+cli.py
+rag_agent.py
+README.md
+provider_compare_20260306.md
+
+sql/
+docling_basics/
+
+ingestion/chunker_no_docling.py
